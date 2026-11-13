@@ -1,0 +1,28 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+
+*.log
+dev.out.log
+dev.err.log
+.tsbuildinfo
+.tsbuildinfo.*
+*.tsbuildinfo
+.screenshots/
+.trae-html-share-packages/
+
+# 本地数据库与用户数据
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
