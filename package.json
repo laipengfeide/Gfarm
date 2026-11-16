@@ -6,17 +6,21 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "check:hotspots": "node scripts/check-hotspots.cjs",
     "preview": "npx serve out"
   },
   "dependencies": {
+    "better-sqlite3": "^9.6.0",
     "next": "13.5.6",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "20.8.10",
     "@types/react": "18.2.37",
     "@types/react-dom": "18.2.15",
+    "puppeteer-core": "^21.11.0",
     "typescript": "5.2.2"
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
-import { ITEMS, NPCS, SHOP_FOOD, SHOP_SEASONING, SHOP_SEEDS, SHOP_TOOLS } from '@/lib/data';
+import { ITEMS, NPCS, SHOP_FOOD, SHOP_FURNITURE, SHOP_SEASONING, SHOP_SEEDS, SHOP_TOOLS, isRomanceCandidate, npcScheduleLabel } from '@/lib/data';
 import { ECON } from '@/lib/economy';
 import type { GameEngine } from '@/lib/engine';
 import type { NpcId } from '@/lib/types';
@@ -19,6 +19,9 @@ export function NpcPanel({
   const [imgOk, setImgOk] = useState(true);
   const hearts = engine.hearts(npcId);
   const dishes = engine.state.dishes;
+  const record = engine.state.npcStories[npcId];
+  const schedule = npcScheduleLabel(npcId, engine.state.minutes);
+  const candidate = isRomanceCandidate(npcId, engine.state.gender);
 
   return (
     <div className="sheet npc-sheet" onClick={(e) => e.stopPropagation()}>
@@ -41,6 +44,15 @@ export function NpcPanel({
             {hearts >= 5 ? '无话不谈' : hearts >= 3 ? '熟络起来了' : hearts >= 1 ? '点头之交' : '还没说上几句话'}
           </span>
         </div>
+        <div className="npc-schedule">今天{schedule}</div>
+        {record.seen.length > 0 && (
+          <div className="npc-stories">
+            听过的故事：{record.seen.map((title) => <span key={title}>{title}</span>)}
+          </div>
+        )}
+        {record.romance
+          ? <div className="npc-romance">♥ {npc.name}把心里的话留给了你</div>
+          : candidate && <div className="npc-candidate">♥ 可以慢慢走近的人</div>}
         <div className="dialogue">{line}</div>
         {giftOpen ? (
           <div style={{ marginTop: 12 }}>
@@ -95,6 +107,7 @@ export function ShopPanel({ engine, close }: { engine: GameEngine; close: () => 
     { title: '调料货架', ids: SHOP_SEASONING },
     { title: '农资', ids: SHOP_TOOLS },
     { title: '食材', ids: SHOP_FOOD },
+    { title: '家具', ids: SHOP_FURNITURE },
   ];
   const sellable = Object.keys(s.inventory).filter((id) => (s.inventory[id] ?? 0) > 0 && ITEMS[id]?.sell > 0);
 

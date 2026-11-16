@@ -71,6 +71,22 @@ export const ART: Record<string, string> = {
   'item.tea': 'assets/ui/item_tea.jpg',
   'item.medicine': 'assets/ui/item_medicine.jpg',
 
+  // ── 昆虫收集 ──
+  'item.insect_butterfly': 'assets/ui/insect_butterfly.jpg',
+  'item.insect_ladybug': 'assets/ui/insect_ladybug.jpg',
+  'item.insect_snail': 'assets/ui/insect_snail.jpg',
+  'item.insect_cicada': 'assets/ui/insect_cicada.jpg',
+  'item.insect_firefly': 'assets/ui/insect_firefly.jpg',
+  'item.insect_dragonfly': 'assets/ui/insect_dragonfly.jpg',
+
+  // ── 家具收集 ──
+  'item.furniture_stool': 'assets/ui/furniture_stool.jpg',
+  'item.furniture_lamp': 'assets/ui/furniture_lamp.jpg',
+  'item.furniture_shelf': 'assets/ui/furniture_shelf.jpg',
+  'item.furniture_chair': 'assets/ui/furniture_chair.jpg',
+  'item.furniture_screen': 'assets/ui/furniture_screen.jpg',
+  'item.furniture_planter': 'assets/ui/furniture_planter.jpg',
+
   // ── 种子 ──
   'seed.tomato': 'assets/ui/seed_tomato.jpg',
   'seed.potato': 'assets/ui/seed_potato.jpg',

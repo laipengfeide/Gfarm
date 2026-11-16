@@ -1,9 +1,11 @@
 import {
- CROPS, DARK_DISH, DISHES, DRINKS, ITEMS, NPCS, QUESTS, RECIPES, FISH_POOL, WEATHER_INFO,
-  createInitialState, createStock, matchRecipe, type QuestDef,
+ CROPS, CROP_ORDER, DARK_DISH, DISHES, DRINKS, INSECT_DEFS, ITEMS, NPCS, NPC_ORDER, NPC_STORIES, QUESTS, RECIPES,
+  COLLECTIBLE_TOTALS, FISH_POOL, WEATHER_INFO, worldNews, festivalForDay,
+  createInitialState, createStock, matchRecipe, rollWeatherFor, seasonForDay, SEASON_INFO,
+  isRomanceCandidate, npcVisibleFor, type QuestDef,
 } from './data';
 import type {
-  CookResult, CropId, Dish, GameState, NpcId, Recipe, ToastKind, Weather,
+  CookResult, CropId, Dish, GameState, Gender, NpcId, OfflineReport, RatingInfo, Recipe, SceneId, ToastKind, Weather,
 } from './types';
 import { ECON } from './economy';
 import { saveGame } from './save';
@@ -63,9 +65,12 @@ export class GameEngine {
   notifyToast: (msg: string, kind?: ToastKind) => void = () => {};
   fx: (kind: SoundKind) => void = (k) => play(k);
 
-  constructor(state: GameState = createInitialState()) {
-    this.state = state;
+  constructor(state?: GameState, gender: Gender = 'female', dayCap?: number) {
+    this.state = state ?? createInitialState(gender);
+    this.dayCap = dayCap ?? null;
   }
+  /** 游客模式：只允许停在第一天，跨夜由服务端和这里双重拦住 */
+  private dayCap: number | null = null;
 
   /* ---------- 订阅 ---------- */
   subscribe = (fn: () => void) => {
@@ -74,6 +79,8 @@ export class GameEngine {
   };
   getVersion = () => this.version;
   private commit(save = true) {
+    this.state.lastSavedAt = Date.now();
+    this.refreshRating();
     if (save) saveGame(this.state);
     this.version += 1;
     this.listeners.forEach((l) => l());
@@ -436,11 +443,31 @@ export class GameEngine {
     const npc = NPCS[npcId];
     if (!this.spend(ACTIONS.talk.min, ACTIONS.talk.energy, 1)) return '……';
     const firstToday = s.npcs[npcId].lastTalkDay !== s.day;
+    const before = this.hearts(npcId);
     s.npcs[npcId].lastTalkDay = s.day;
     s.npcs[npcId].points += firstToday ? 1 : 0;
     s.mood = clamp(s.mood + (firstToday ? 8 : 3));
     this.exposure(0.4);
     if (firstToday) this.completeQuest('talk');
+
+    const after = this.hearts(npcId);
+    const record = s.npcStories[npcId];
+    const story = NPC_STORIES[npcId].find((st) => st.level <= after && st.level > before && !record.seen.includes(st.title));
+    record.level = Math.max(record.level, after);
+    if (story) {
+      record.seen.push(story.title);
+      this.sound('success');
+      const romanceable = npcId === 'girl' || isRomanceCandidate(npcId, s.gender);
+      if (romanceable && story.level >= 5 && !record.romance) {
+        record.romance = true;
+        this.toast(`${npc.name}把心里的话说出口了。你们之间，多了一盏留给彼此的灯。`, 'good');
+      } else {
+        this.toast(`听到了${npc.name}的一段往事：${story.title}`, 'good');
+      }
+      this.commit();
+      return story.text;
+    }
+
     this.commit();
     return rand(npc.lines);
   }
@@ -456,6 +483,7 @@ export class GameEngine {
     if (!this.spend(ACTIONS.gift.min, ACTIONS.gift.energy)) return false;
     s.dishes.splice(dishIndex, 1);
     s.npcs[npcId].points += 2;
+    s.npcStories[npcId].level = Math.max(s.npcStories[npcId].level, this.hearts(npcId));
     s.mood = clamp(s.mood + 4);
     const npc = NPCS[npcId];
     this.toast(`${npc.name}收下了${dish.name}，笑得眼睛都弯了。`, 'good');
@@ -842,6 +870,11 @@ export class GameEngine {
     s.coins -= total;
     s.stock[id] = stock - n;
     s.inventory[id] = (s.inventory[id] ?? 0) + n;
+    if (def.kind === 'furniture' && !s.collections.furniture.includes(id)) {
+      s.collections.furniture.push(id);
+      this.toast(`家具图鉴新收录：${def.icon} ${def.name}。`, 'good');
+      this.sound('success');
+    }
     this.sound('coin');
     this.toast(`买了 ${def.icon} ${def.name} ×${n}，花了 ${total} 文，还剩 ${s.coins} 文。`);
     this.commit();
@@ -870,9 +903,74 @@ export class GameEngine {
     return true;
   }
 
-  /* ---------- 睡觉 / 新的一天 ---------- */
-  sleep(): SleepSummary {
+  /* ---------- 观察昆虫 ---------- */
+  catchInsect(scene: SceneId): boolean {
     const s = this.state;
+    if (!this.spend(10, 2, 1)) return false;
+    const season = seasonForDay(s.day);
+    const hour = s.minutes / 60;
+    const pool = INSECT_DEFS.filter((d) => (
+      d.scenes.includes(scene)
+      && d.seasons.includes(season)
+      && hour >= d.from && hour <= d.to
+      && d.weather.includes(s.weather)
+    ));
+    const fresh = pool.filter((d) => !s.collections.insects.includes(d.id));
+    const target = fresh.length ? rand(fresh) : (pool.length ? rand(pool) : null);
+    if (!target) {
+      this.toast('这会儿没看到什么特别的小东西。换个时段、天气或季节再来蹲一会儿吧。');
+      this.commit();
+      return false;
+    }
+    if (Math.random() > 0.72) {
+      this.toast(`看见一只${target.name}，手慢了一步，它跑了。`, 'warn');
+      this.commit();
+      return false;
+    }
+    const first = !s.collections.insects.includes(target.id);
+    if (first) s.collections.insects.push(target.id);
+    s.inventory[target.id] = (s.inventory[target.id] ?? 0) + 1;
+    s.mood = clamp(s.mood + 3);
+    this.sound('success');
+    if (first) {
+      this.toast(`图鉴新收录：${target.emoji} ${target.name}！${ITEMS[target.id]?.desc ?? ''}`, 'good');
+    } else {
+      this.toast(`又遇见一只${target.emoji} ${target.name}，收进背包了。`, 'good');
+    }
+    this.commit();
+    return true;
+  }
+
+  /* ---------- 季节节日 ---------- */
+  joinFestival(): boolean {
+    const s = this.state;
+    const festival = festivalForDay(s.day);
+    if (!festival) return false;
+    if (s.collections.festivals.includes(festival.id)) {
+      this.toast('这个节日已经参加过了，热闹留在记忆里就好。');
+      return false;
+    }
+    if (!this.spend(60, 2)) return false;
+    s.collections.festivals.push(festival.id);
+    s.coins += festival.reward.coins;
+    Object.entries(festival.reward.items ?? {}).forEach(([id, n]) => {
+      s.inventory[id] = (s.inventory[id] ?? 0) + n;
+    });
+    s.mood = clamp(s.mood + 12);
+    this.toast(`${festival.icon} ${festival.name}：${festival.desc} 你带回了 ${festival.reward.coins} 文和${festival.reward.note}。`, 'good');
+    this.sound('success');
+    this.commit();
+    return true;
+  }
+
+  /* ---------- 睡觉 / 新的一天 ---------- */
+  sleep(): SleepSummary | null {
+    const s = this.state;
+    if (this.dayCap !== null && s.day >= this.dayCap) {
+      this.toast('游客只能体验一天。注册后，就能接着把今晚过完、把明天也过下去。', 'warn');
+      this.sound('fail');
+      return null;
+    }
     const medsTaken = s.medicineToday;
     const summary: SleepSummary = {
       day: s.day + 1,
@@ -888,41 +986,69 @@ export class GameEngine {
       cold: s.cold,
       sales: s.salesToday,
     };
+    const prevSeason = seasonForDay(s.day);
+
+    // 先按「今天」的天气与状态结算，再把天气换成明天
+    this.settleDay(false);
+
     s.day += 1;
     s.minutes = 6 * 60;
     s.weather = s.tomorrowWeather;
     s.tomorrowWeather = this.rollWeather();
     summary.nextWeather = s.weather;
+    if (s.weather === 'rain' || s.weather === 'storm') {
+      s.plots.forEach((p) => { if (p.crop) p.watered = true; });
+    }
 
-    // 夜间身体结算
+    s.stock = createStock();
+    s.quests = { cook: false, harvest: false, feed: false, talk: false };
+    summary.health = s.health;
+    summary.hygiene = s.hygiene;
+    summary.cold = s.cold;
+    if (s.cold > 0 && medsTaken === 0) this.toast('夜里咳了几声，感冒还没好。记得按时吃药。', 'warn');
+    const nextSeason = seasonForDay(s.day);
+    if (nextSeason !== prevSeason) {
+      this.toast(`换季了，${SEASON_INFO[nextSeason].name}天到了。${SEASON_INFO[nextSeason].note}`, 'good');
+    }
+    const festival = festivalForDay(s.day);
+    if (festival) this.toast(`${festival.icon} 今天是${festival.name}：${festival.desc}`, 'good');
+    this.sound('sleep');
+    this.commit();
+    return summary;
+  }
+
+  /** 一天的结算；sleep 与离线回归共用，避免两套日结算逻辑 */
+  private settleDay(offline: boolean) {
+    const s = this.state;
+    const todayWeather = s.weather;
+
+    // 夜间身体结算（不设 Game Over，健康与饥饿都有下限）
     s.hunger = clamp(s.hunger - 7, 15, 100);
     s.hygiene = clamp(s.hygiene - (4 + (s.cold > 0 ? 3 : 0)));
     if (s.hygiene < 30) {
-      s.health = clamp(s.health - 5);
+      s.health = clamp(s.health - 5, 12, 100);
       s.mood = clamp(s.mood - 5);
     } else {
-      s.health = clamp(s.health + 2);
+      s.health = clamp(s.health + 2, 12, 100);
     }
-    if (s.hunger < 22) s.health = clamp(s.health - 3);
+    if (s.hunger < 22) s.health = clamp(s.health - 3, 12, 100);
     if (s.cold > 0) {
       if (s.medicineToday < 2) {
         s.cold = clamp(s.cold + 8);
-        s.health = clamp(s.health - 4);
+        s.health = clamp(s.health - 4, 12, 100);
         s.mood = clamp(s.mood - 4);
       } else {
         s.cold = Math.max(0, s.cold - 12);
-        s.health = clamp(s.health + 2);
-        if (s.cold <= 0) summary.cold = 0;
+        s.health = clamp(s.health + 2, 12, 100);
       }
-      summary.cold = s.cold;
     }
     s.energy = 100;
     if (s.mealsToday >= 3) {
       s.mood = clamp(s.mood + 3);
-      s.health = clamp(s.health + 2);
+      s.health = clamp(s.health + 2, 12, 100);
     } else if (s.mealsToday <= 1) {
       s.mood = clamp(s.mood - 4);
-      s.health = clamp(s.health - 2);
+      s.health = clamp(s.health - 2, 12, 100);
     }
     s.mood = clamp(s.mood + (s.yardClean < 40 ? -6 : 2));
     s.yardClean = clamp(s.yardClean - 18);
@@ -933,49 +1059,145 @@ export class GameEngine {
     s.medicineToday = 0;
     s.stuffedUntil = 0;
 
+    const season = seasonForDay(s.day);
     s.plots.forEach((p) => {
       if (!p.crop) { p.watered = false; return; }
       const crop = CROPS[p.crop];
       const mature = p.stage >= crop.growDays;
       if (!mature) {
         if (!p.pest && !p.weed && p.watered) {
-          p.stage = Math.min(crop.growDays, p.stage + 1);
+          // 当季作物每天长一格；错季只有一半几率生长，给玩家补救的余地
+          const inSeason = !crop.seasons || crop.seasons.includes(season);
+          const step = inSeason ? 1 : (Math.random() < 0.5 ? 1 : 0);
+          if (step > 0) p.stage = Math.min(crop.growDays, p.stage + step);
           p.watered = false;
         } else if (!p.watered && !p.weed && Math.random() < 0.28) {
           p.weed = true;
         }
-        if (p.stage > 0 && Math.random() < (s.weather === 'storm' ? 0.25 : 0.12)) p.pest = true;
+        if (p.stage > 0 && Math.random() < (todayWeather === 'storm' ? 0.25 : 0.12)) p.pest = true;
       }
-      if (s.weather === 'rain' || s.weather === 'storm') p.watered = true;
+      if (todayWeather === 'rain' || todayWeather === 'storm') p.watered = true;
     });
 
     if (s.chickens.fed) { s.chickens.eggs += 2; s.chickens.fed = false; }
     if (s.pig.fed) { s.pig.manure += 1; s.pig.fed = false; }
 
-    // 农产品的 freshness 随时间下降
+    // 离线期间新鲜度掉得慢一些，避免回来时食材全坏
+    const spoil = offline ? 7 : ECON.spoilPerDay;
     Object.keys(s.meta).forEach((id) => {
       const m = s.meta[id];
-      if (m) m.fresh = clamp(m.fresh - 10, 0, 100);
+      if (m) m.fresh = clamp(m.fresh - spoil, 0, 100);
     });
+  }
 
+  /** 离线回归：8 小时算一个游戏日，最多补 3 天，只结算生长与蛋肥，不发钱 */
+  applyOffline(): OfflineReport | null {
+    const s = this.state;
+    const dayMs = 8 * 60 * 60 * 1000;
+    const elapsed = Date.now() - (s.lastSavedAt || Date.now());
+    if (elapsed < dayMs) {
+      s.lastSavedAt = Date.now();
+      saveGame(s);
+      return null;
+    }
+    // 游客不能在离线结算里跨过第一个夜晚
+    if (this.dayCap !== null && s.day >= this.dayCap) {
+      s.lastSavedAt = Date.now();
+      saveGame(s);
+      return null;
+    }
+    const days = Math.min(3, Math.floor(elapsed / dayMs));
+    let grown = 0;
+    let eggs = 0;
+    let manure = 0;
+    let spoiled = 0;
+
+    for (let i = 0; i < days; i += 1) {
+      const beforeStage = s.plots.map((p) => p.stage);
+      const beforeEggs = s.chickens.eggs;
+      const beforeManure = s.pig.manure;
+      const beforeFresh: Record<string, number> = {};
+      Object.keys(s.meta).forEach((id) => { beforeFresh[id] = s.meta[id].fresh; });
+
+      this.settleDay(true);
+      grown += s.plots.reduce((sum, p, idx) => sum + Math.max(0, p.stage - beforeStage[idx]), 0);
+      eggs += s.chickens.eggs - beforeEggs;
+      manure += s.pig.manure - beforeManure;
+      Object.keys(s.meta).forEach((id) => {
+        spoiled += Math.max(0, (beforeFresh[id] ?? 100) - s.meta[id].fresh);
+      });
+
+      s.day += 1;
+      s.minutes = 6 * 60;
+      s.weather = s.tomorrowWeather;
+      s.tomorrowWeather = this.rollWeather();
+      if (s.weather === 'rain' || s.weather === 'storm') {
+        s.plots.forEach((p) => { if (p.crop) p.watered = true; });
+      }
+    }
+
+    // 补货只补最后一天，避免离线多日囤货套利
     s.stock = createStock();
     s.quests = { cook: false, harvest: false, feed: false, talk: false };
-    summary.health = s.health;
-    summary.hygiene = s.hygiene;
-    summary.cold = s.cold;
-    if (s.cold > 0 && medsTaken === 0) this.toast('夜里咳了几声，感冒还没好。记得按时吃药。', 'warn');
-    this.sound('sleep');
+    const streak = elapsed < 72 * 60 * 60 * 1000 ? s.streak.count + 1 : 1;
+    s.streak = { lastDay: s.day, count: streak };
+
+    const close = npcVisibleFor(s.gender)
+      .filter((id) => s.npcs[id].points >= 6)
+      .map((id) => NPCS[id].name)[0];
+    const visit = close ? ` ${close}这几天来过院子，见你不在，留了句话又走了。` : '';
+    const report: OfflineReport = {
+      days, grown, eggs, manure, spoiled: Math.round(spoiled), streak,
+      news: worldNews(s.day) + visit,
+    };
+    s.offlineReport = report;
+    this.refreshRating(false);
     this.commit();
-    return summary;
+    return report;
+  }
+
+  /** 小院评级：收集 / 收成 / 关系 / 家务 / 积蓄 五维，永远有继续变好的空间 */
+  ratingNow(): RatingInfo {
+    const s = this.state;
+    const collection = Math.round((
+      s.discovered.crops.length / COLLECTIBLE_TOTALS.crops
+      + s.discovered.fish.length / COLLECTIBLE_TOTALS.fish
+      + s.discovered.recipes.filter((id) => !id.startsWith('gift_')).length / COLLECTIBLE_TOTALS.recipes
+      + s.collections.insects.length / COLLECTIBLE_TOTALS.insects
+      + s.collections.furniture.length / COLLECTIBLE_TOTALS.furniture
+    ) / 5 * 40);
+    const harvest = Math.min(20, Math.round(
+      s.counters.harvest / 40 * 10 + s.counters.cooked / 20 * 5 + s.counters.fish / 12 * 5,
+    ));
+    const bondPoints = npcVisibleFor(s.gender).reduce((sum, id) => sum + this.hearts(id), 0);
+    const bonds = Math.round(bondPoints / 15 * 15);
+    const home = Math.round(s.yardClean / 100 * 10);
+    const savings = Math.min(10, Math.round(s.coins / 600 * 10));
+    const score = Math.min(100, collection + harvest + bonds + home + savings);
+    return {
+      score,
+      grade: score >= 90 ? 'S' : score >= 75 ? 'A' : score >= 60 ? 'B' : 'C',
+      updatedDay: s.day,
+      dims: { collection, harvest, bonds, home, savings },
+    };
+  }
+
+  private refreshRating(announce = true) {
+    const s = this.state;
+    const next = this.ratingNow();
+    const prev = s.rating;
+    const rank = { C: 0, B: 1, A: 2, S: 3 } as const;
+    // 评级只升不降：一次失误不会把已经达到的等级收回去
+    if (rank[next.grade] < rank[prev.grade]) next.grade = prev.grade;
+    if (announce && prev.score > 0 && rank[next.grade] > rank[prev.grade]) {
+      this.toast(`小院评级升到了 ${next.grade} 级（${next.score} 分）。这一院子的日子，越来越像样了。`, 'good');
+      this.sound('success');
+    }
+    s.rating = next;
   }
 
   private rollWeather(): Weather {
-    const r = Math.random();
-    if (r < 0.42) return 'sunny';
-    if (r < 0.68) return 'cloudy';
-    if (r < 0.84) return 'rain';
-    if (r < 0.92) return 'storm';
-    return 'fog';
+    return rollWeatherFor(seasonForDay(this.state.day));
   }
 
   forecast() {

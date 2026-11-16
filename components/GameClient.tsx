@@ -1,25 +1,34 @@
 'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  CROPS, CLOCK_TEXT, MONTH, NAV_ICONS, QUESTS, SCENES, SCENE_ORDER, TIME_LABEL, WEATHER_INFO,
+  CROPS, CLOCK_TEXT, NAV_ICONS, NPCS, QUESTS, SCENES, SCENE_ORDER, TIME_LABEL, WEATHER_INFO,
+  SEASON_INFO, createInitialState, festivalForDay, npcScheduleFor, npcVisibleFor, seasonForDay, seasonDayForDay, seasonText,
 } from '@/lib/data';
 import { GameEngine, type SleepSummary } from '@/lib/engine';
-import { hasSave, loadGame, saveGame } from '@/lib/save';
+import {
+  GUEST_LIMIT_EVENT, SESSION_LOST_EVENT, flushSave, hasLegacySave, readLegacyRaw, saveGame,
+} from '@/lib/save';
+import { api, ApiError, type AccountUser } from '@/lib/api';
+import { migrateSave } from '@/lib/save-migrate';
 import { isSoundEnabled, loadSoundPref, play, setSoundEnabled, type SoundKind } from '@/lib/audio';
 import { armMusic, isMusicEnabled, loadMusicPref, musicScene, setMusicEnabled } from '@/lib/music';
+import { FESTIVAL_HOTSPOT } from '@/lib/hotspot-layout';
 import ClickFX from '@/components/ClickFX';
 import BgImage from '@/components/BgImage';
-import type { NpcId, SceneId, ToastKind } from '@/lib/types';
+import type { GameState, NpcId, OfflineReport, SceneId, ToastKind } from '@/lib/types';
 import FarmPanel from '@/components/panels/FarmPanel';
 import CookingPanel from '@/components/panels/CookingPanel';
 import { NpcPanel, ShopPanel, CardsPanel } from '@/components/panels/VillagePanels';
 import { FishingPanel } from '@/components/panels/FishingPanel';
 import {
-  BagPanel, CodexPanel, MealsPanel, ChickenPanel, PigPanel, SleepPanel, SummaryPanel, MenuPanel,
+  BagPanel, CodexPanel, MealsPanel, ChickenPanel, PigPanel, SleepPanel, SummaryPanel, MenuPanel, OfflinePanel,
+  FestivalPanel,
 } from '@/components/panels/SidePanels';
 import { WashPanel, RadioPanel, HealthPanel } from '@/components/panels/CarePanels';
 import DrinksPanel from '@/components/panels/DrinksPanel';
 import Petals from '@/components/Petals';
+import AuthSheet from '@/components/AuthSheet';
+import AccountPanel from '@/components/panels/AccountPanel';
 
 type Overlay =
   | { type: 'farm' } | { type: 'cook' } | { type: 'meals' } | { type: 'bag' } | { type: 'codex' }
@@ -27,41 +36,141 @@ type Overlay =
   | { type: 'menu' } | { type: 'chicken' } | { type: 'pig' } | { type: 'radio' } | { type: 'health' }
   | { type: 'wash'; location: 'home' | 'well' | 'stream' }
   | { type: 'drink' }
-  | { type: 'npc'; id: NpcId } | { type: 'summary'; data: SleepSummary };
+  | { type: 'npc'; id: NpcId } | { type: 'summary'; data: SleepSummary }
+  | { type: 'offline'; data: OfflineReport }
+  | { type: 'festival' }
+  | { type: 'account' }
+  | { type: 'auth'; mode: 'login' | 'register'; reason?: 'guest' };
 
 interface ToastItem { id: number; msg: string; kind: ToastKind }
 
+interface BootInfo {
+  user: AccountUser | null;
+  hasSave: boolean;
+  hasLegacy: boolean;
+  guestLocked: boolean;
+}
+
 export default function GameClient() {
   const [engine, setEngine] = useState<GameEngine | null>(null);
+  const [offline, setOffline] = useState<OfflineReport | null>(null);
+  const [boot, setBoot] = useState<BootInfo | null>(null);
+  const [bootError, setBootError] = useState('');
+  const [starting, setStarting] = useState(false);
 
-  const start = (fresh: boolean) => {
-    const state = fresh ? null : loadGame();
-    const eng = new GameEngine(state ?? undefined);
-    if (!state) {
-      saveGame(eng.state);
+  // 进游戏前先问服务端「我是谁、我有没有存档」，前端不碰正式存档
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const me = await api.me();
+        if (!me.user) await api.ensureGuest();
+        const payload = await api.loadSave();
+        if (!alive) return;
+        setBoot({ user: me.user, hasSave: !!payload.state, hasLegacy: hasLegacySave(), guestLocked: !!payload.locked });
+      } catch {
+        if (!alive) return;
+        setBootError('没有连上小院的服务端，请确认本地服务在运行后刷新。');
+        setBoot({ user: null, hasSave: false, hasLegacy: hasLegacySave(), guestLocked: false });
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const start = async (fresh: boolean) => {
+    const info = boot;
+    if (!info || starting) return;
+    setStarting(true);
+    setBootError('');
+    try {
+      let state: GameState | null = null;
+      let restored = false;
+      if (!fresh && info.hasSave) {
+        const payload = await api.loadSave();
+        state = migrateSave(payload.state);
+        restored = !!state;
+      }
+      if (!state) {
+        state = createInitialState(info.user?.gender ?? 'female');
+        saveGame(state);
+        await flushSave();
+      }
+      const eng = new GameEngine(state, info.user?.gender ?? 'female', info.user ? undefined : 1);
+      const report = restored ? eng.applyOffline() : null;
+      try { void loadSoundPref(); } catch { /* ignore */ }
+      setOffline(report);
+      setEngine(eng);
+    } catch (e) {
+      setBootError(e instanceof ApiError ? e.message : '读取进度失败了，刷新后再试一次。');
+      setStarting(false);
     }
-    try { void loadSoundPref(); } catch { /* ignore */ }
-    setEngine(eng);
   };
 
-  if (!engine) return <BootScreen onStart={start} />;
+  if (!engine) {
+    return (
+      <>
+        <BootScreen
+          info={boot}
+          error={bootError}
+          starting={starting}
+          onStart={(fresh) => { void start(fresh); }}
+          onAuthed={() => window.location.reload()}
+        />
+        <ClickFX />
+      </>
+    );
+  }
   return (
     <>
       <ClickFX />
-      <GameView engine={engine} />
+      <GameView engine={engine} offlineReport={offline} user={boot?.user ?? null} />
     </>
   );
 }
 
 /* ==================== 标题页 ==================== */
-function BootScreen({ onStart }: { onStart: (fresh: boolean) => void }) {
-  const [hasFile, setHasFile] = useState(false);
+function BootScreen({
+  info, error, starting, onStart, onAuthed,
+}: {
+  info: BootInfo | null;
+  error: string;
+  starting: boolean;
+  onStart: (fresh: boolean) => void;
+  onAuthed: () => void;
+}) {
   const [askNew, setAskNew] = useState(false);
+  const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
+  const [busy, setBusy] = useState('');
 
-  useEffect(() => {
-    setHasFile(hasSave());
-    armMusic();
-  }, []);
+  useEffect(() => { armMusic(); }, []);
+
+  const user = info?.user ?? null;
+  const hasSave = info?.hasSave ?? false;
+  const hasLegacy = info?.hasLegacy ?? false;
+
+  const logout = async () => {
+    setBusy('logout');
+    try {
+      await api.logout();
+      window.location.reload();
+    } catch {
+      setBusy('');
+    }
+  };
+
+  const importLegacy = async () => {
+    const raw = readLegacyRaw();
+    if (!raw) return;
+    if (!window.confirm('导入会用这份旧进度覆盖当前账号的存档，且每个账号只能导入一次。继续吗？')) return;
+    setBusy('import');
+    try {
+      await api.importLegacy(raw);
+      window.location.reload();
+    } catch {
+      setBusy('');
+      window.alert('导入失败，稍后再试。');
+    }
+  };
 
   return (
     <section className="boot">
@@ -71,30 +180,80 @@ function BootScreen({ onStart }: { onStart: (fresh: boolean) => void }) {
         <div className="boot-mark">田 园 生 活</div>
         <h1 className="boot-title">晚风小院</h1>
         <div className="boot-sub">在山与海之间，耕种、做饭、慢慢生活</div>
+
+        {user && (
+          <div className="boot-user">
+            以 {user.username} 的身份 · {user.gender === 'female' ? '女号' : '男号'} · 可攻略 {user.gender === 'female' ? '程远 / 陈石' : '苏棠 / 林知夏'}
+          </div>
+        )}
+        {!user && info && (
+          <div className="boot-user">游客体验 · 女号 · 只能玩一天</div>
+        )}
+        {!user && info?.guestLocked && (
+          <div className="auth-err boot-err">这份游客进度已经用完一天了。注册后，就能接着把故事过下去。</div>
+        )}
+        {error && <div className="auth-err boot-err">{error}</div>}
+
         <div className="boot-buttons">
-          {hasFile && !askNew && (
-            <button className="btn btn-primary" onClick={() => onStart(false)}>继续上次的生活</button>
+          {hasSave && !askNew && (
+            <button className="btn btn-primary" disabled={starting} onClick={() => onStart(false)}>
+              {starting ? '正在回到小院…' : '继续上次的生活'}
+            </button>
           )}
           {!askNew && (
-            <button className="btn" onClick={() => { if (hasFile) setAskNew(true); else onStart(true); }}>
-              {hasFile ? '开始新的生活' : '开始新的生活'}
+            <button className="btn btn-primary" disabled={!info || starting} onClick={() => { if (hasSave) setAskNew(true); else onStart(true); }}>
+              {!info ? '正在翻找信箱…' : hasSave ? '重新开始' : '开始新的生活'}
             </button>
           )}
           {askNew && (
             <>
-              <button className="btn btn-primary" onClick={() => onStart(true)}>确认覆盖进度</button>
+              <button className="btn btn-primary" onClick={() => { setAskNew(false); onStart(true); }}>确认覆盖进度</button>
               <button className="btn" onClick={() => setAskNew(false)}>取消</button>
             </>
           )}
+          {user && hasLegacy && !user.legacyImported && (
+            <button className="btn btn-ghost" disabled={busy === 'import'} onClick={() => void importLegacy()}>
+              {busy === 'import' ? '正在导入…' : '导入旧的本地进度'}
+            </button>
+          )}
         </div>
-        <div className="boot-foot">鼠标点击操作 · 进度自动保存在本地 · 建议横屏全屏游玩</div>
+
+        {info && (
+          <div className="boot-links">
+            {user ? (
+              <button className="boot-link" disabled={busy === 'logout'} onClick={() => void logout()}>
+                {busy === 'logout' ? '正在退出…' : '退出登录'}
+              </button>
+            ) : (
+              <>
+                <button className="boot-link" onClick={() => setAuthMode('login')}>登录</button>
+                <span className="boot-dot">·</span>
+                <button className="boot-link" onClick={() => setAuthMode('register')}>注册</button>
+              </>
+            )}
+          </div>
+        )}
+
+        <div className="boot-foot">
+          {user ? '进度保存在账号里，换台设备登录也能回到自己的小院' : '游客可体验一天，注册后长期保存进度'}
+        </div>
       </div>
+
+      {authMode && (
+        <div className="overlay" onClick={() => setAuthMode(null)}>
+          <AuthSheet
+            initialMode={authMode}
+            close={() => setAuthMode(null)}
+            onDone={onAuthed}
+          />
+        </div>
+      )}
     </section>
   );
 }
 
 /* ==================== 主游戏 ==================== */
-function GameView({ engine }: { engine: GameEngine }) {
+function GameView({ engine, offlineReport, user }: { engine: GameEngine; offlineReport: OfflineReport | null; user: AccountUser | null }) {
   useSyncExternalVersion(engine);
   const [scene, setScene] = useState<SceneId>('home');
   const [overlay, setOverlay] = useState<Overlay | null>(null);
@@ -104,6 +263,8 @@ function GameView({ engine }: { engine: GameEngine }) {
   const toastId = useRef(0);
   const welcomed = useRef(false);
   const state = engine.state;
+  // 主角名字跟随账号；游客没有账号，仍用原本的「阿禾」
+  const playerName = user?.username ?? '阿禾';
 
   const pushToast = useCallback((msg: string, kind: ToastKind = 'info') => {
     const id = ++toastId.current;
@@ -117,6 +278,21 @@ function GameView({ engine }: { engine: GameEngine }) {
     engine.notifyToast = pushToast;
     engine.fx = (kind: SoundKind) => { if (isSoundEnabled()) play(kind); };
   }, [engine, pushToast]);
+
+  // 游客跨夜 / 登录过期都由服务端回执触发，前端只负责把界面切到注册或登录
+  useEffect(() => {
+    const onLimit = () => setOverlay({ type: 'auth', mode: 'register', reason: 'guest' });
+    const onLost = () => {
+      pushToast('登录状态过期了，请重新登录。', 'warn');
+      setOverlay({ type: 'auth', mode: 'login' });
+    };
+    window.addEventListener(GUEST_LIMIT_EVENT, onLimit);
+    window.addEventListener(SESSION_LOST_EVENT, onLost);
+    return () => {
+      window.removeEventListener(GUEST_LIMIT_EVENT, onLimit);
+      window.removeEventListener(SESSION_LOST_EVENT, onLost);
+    };
+  }, [pushToast]);
 
   useEffect(() => {
     const on = loadSoundPref();
@@ -134,6 +310,11 @@ function GameView({ engine }: { engine: GameEngine }) {
   useEffect(() => {
     if (welcomed.current) return;
     welcomed.current = true;
+    if (offlineReport) {
+      setOverlay({ type: 'offline', data: offlineReport });
+      pushToast(`回来了。你不在的这几天，院子悄悄发生了些变化。`, 'good');
+      return;
+    }
     pushToast('晨光落在木地板上。新的一天，从照顾好自己开始。');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -178,6 +359,8 @@ function GameView({ engine }: { engine: GameEngine }) {
       case 'act:stroll': engine.stroll(); break;
       case 'act:cloud': engine.lookClouds(); break;
       case 'act:forage': engine.forage(); break;
+      case 'act:bugs': engine.catchInsect(scene); break;
+      case 'open:festival': setOverlay({ type: 'festival' }); break;
       case 'act:help': engine.helpNeighbor(); break;
       default: break;
     }
@@ -185,6 +368,28 @@ function GameView({ engine }: { engine: GameEngine }) {
 
   const def = SCENES[scene];
   const w = WEATHER_INFO[state.weather];
+  const season = seasonForDay(state.day);
+  const seasonMeta = SEASON_INFO[season];
+  const seasonNum = seasonDayForDay(state.day);
+  const NPC_ICONS: Record<NpcId, string> = {
+    grandma: '👵', girl: '👧', uncle: '🧓', student: '🧑‍🎓', buddy: '🔧', sweetheart: '👩', teacher: '👩‍🏫',
+  };
+  const baseHotspots = SCENES[scene].hotspots.filter((h) => !h.action.startsWith('npc:'));
+  const npcHotspots = npcVisibleFor(state.gender).flatMap((id) => {
+    const block = npcScheduleFor(id, state.minutes);
+    if (!block || block.scene !== scene) return [];
+    return [{
+      id: `npc-${id}`, icon: NPC_ICONS[id], label: NPCS[id].name,
+      note: block.note, x: block.x, y: block.y, action: `npc:${id}`,
+    }];
+  });
+  const hotspots = [
+    ...baseHotspots,
+    ...npcHotspots,
+    ...(scene === 'village' && festivalForDay(state.day)
+      ? [{ id: 'festival', icon: '🏮', label: '节日', note: '今天的村子格外热闹', ...FESTIVAL_HOTSPOT, action: 'open:festival' }]
+      : []),
+  ];
   const hour = state.minutes / 60;
   const late = state.minutes >= 22 * 60;
   const matureCount = state.plots.filter((p) => p.crop && p.stage >= CROPS[p.crop].growDays).length;
@@ -238,6 +443,7 @@ function GameView({ engine }: { engine: GameEngine }) {
           />
         </div>
         <div className="tint" style={{ background: tint }} />
+        <div className="season-tone" style={{ background: seasonMeta.tint }} />
         {(state.weather === 'rain' || state.weather === 'storm') && <RainOverlay storm={state.weather === 'storm'} />}
         {state.weather === 'fog' && <div className="fog-fx" />}
         {state.hygiene < 78 && (
@@ -253,19 +459,20 @@ function GameView({ engine }: { engine: GameEngine }) {
           </div>
           <div className="top-right">
             <div className="pill"><span>{w.icon}</span> {w.label}</div>
-            <div className="pill clock">第 {state.day} 天 · {CLOCK_TEXT(state.minutes)}</div>
+            <div className="pill clock">第 {state.day} 天 · {seasonMeta.name} D{seasonNum} · {CLOCK_TEXT(state.minutes)}</div>
             <button
               className={`icon-btn music ${musicOn ? '' : 'off'}`}
               title={musicOn ? '背景音乐：开' : '背景音乐：关'}
               onClick={toggleMusic}
             >♫</button>
             <button className={`icon-btn ${soundOn ? '' : 'off'}`} title="音效" onClick={toggleSound}>♪</button>
+            <button className="icon-btn" title={user ? `${user.username} 的账号` : '游客模式 · 注册后可长期保存'} onClick={() => setOverlay({ type: 'account' })}>👤</button>
             <button className="icon-btn" title="菜单" onClick={() => setOverlay({ type: 'menu' })}>≡</button>
           </div>
         </header>
 
         <div className="hotspots">
-          {def.hotspots.map((h, i) => {
+          {hotspots.map((h, i) => {
             const badge = badgeFor(h.id);
             return (
               <button
@@ -288,7 +495,7 @@ function GameView({ engine }: { engine: GameEngine }) {
         <aside className="journal">
           <div className="journal-head">
             <span className="journal-title">今日小事</span>
-            <span className="journal-date">第 {state.day} 天 · {MONTH}</span>
+            <span className="journal-date">第 {state.day} 天 · {seasonText(state.day)}</span>
           </div>
           <ul className="quests">
             {QUESTS.map((q) => {
@@ -311,10 +518,11 @@ function GameView({ engine }: { engine: GameEngine }) {
         </aside>
 
         <div className="hud">
-          <div className="hud-portrait"><img src="assets/portrait.jpg" alt="阿禾" /></div>
+          <div className="hud-portrait"><img src="assets/portrait.jpg" alt={playerName} /></div>
           <div className="hud-main">
             <div className="hud-name">
-              阿禾 <span className="hud-title">{TIME_LABEL(state.minutes)} · {w.label}
+              <span className="hud-player" title={playerName}>{playerName}</span>
+              <span className="hud-title">{TIME_LABEL(state.minutes)} · {w.label}
                 {state.cold > 0 ? ' · 🤒' : ''}
                 {stuffed ? ' · 有点撑' : ''}
               </span>
@@ -354,7 +562,7 @@ function GameView({ engine }: { engine: GameEngine }) {
 
       {overlay && (
         <div className="overlay" onClick={() => { if (overlay.type !== 'cook') close(); }}>
-          <OverlayRouter engine={engine} overlay={overlay} close={close} setOverlay={setOverlay} soundOn={soundOn} toggleSound={toggleSound} />
+          <OverlayRouter engine={engine} overlay={overlay} close={close} setOverlay={setOverlay} soundOn={soundOn} toggleSound={toggleSound} user={user} />
         </div>
       )}
     </main>
@@ -362,10 +570,11 @@ function GameView({ engine }: { engine: GameEngine }) {
 }
 
 function OverlayRouter({
-  engine, overlay, close, setOverlay, soundOn, toggleSound,
+  engine, overlay, close, setOverlay, soundOn, toggleSound, user,
 }: {
   engine: GameEngine; overlay: Overlay; close: () => void;
   setOverlay: (o: Overlay | null) => void; soundOn: boolean; toggleSound: () => void;
+  user: AccountUser | null;
 }) {
   switch (overlay.type) {
     case 'farm': return <FarmPanel engine={engine} close={close} />;
@@ -382,9 +591,33 @@ function OverlayRouter({
     case 'drink': return <DrinksPanel engine={engine} close={close} />;
     case 'radio': return <RadioPanel engine={engine} close={close} />;
     case 'health': return <HealthPanel engine={engine} close={close} />;
-    case 'sleep': return <SleepPanel engine={engine} close={close} onSleep={(data) => setOverlay({ type: 'summary', data })} />;
+    case 'sleep': return (
+      <SleepPanel
+        engine={engine}
+        close={close}
+        onSleep={(data) => setOverlay({ type: 'summary', data })}
+        onGuestBlocked={() => setOverlay({ type: 'auth', mode: 'register', reason: 'guest' })}
+      />
+    );
     case 'summary': return <SummaryPanel summary={overlay.data} close={close} />;
+    case 'offline': return <OfflinePanel engine={engine} report={overlay.data} close={close} />;
+    case 'festival': return <FestivalPanel engine={engine} close={close} />;
     case 'menu': return <MenuPanel engine={engine} close={close} soundOn={soundOn} toggleSound={toggleSound} />;
+    case 'account': return (
+      <AccountPanel
+        user={user}
+        close={close}
+        openAuth={(mode) => setOverlay({ type: 'auth', mode })}
+      />
+    );
+    case 'auth': return (
+      <AuthSheet
+        initialMode={overlay.mode}
+        reason={overlay.reason}
+        close={close}
+        onDone={() => window.location.reload()}
+      />
+    );
     case 'npc':
       return (
         <NpcPanel

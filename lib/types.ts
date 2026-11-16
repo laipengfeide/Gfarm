@@ -1,10 +1,13 @@
 // 游戏数据模型
 export type SceneId = 'home' | 'kitchen' | 'farm' | 'yard' | 'village' | 'pond';
 export type Weather = 'sunny' | 'cloudy' | 'rain' | 'storm' | 'fog';
+export type Season = 'spring' | 'summer' | 'autumn' | 'winter';
+export type Gender = 'female' | 'male';
 export type CropId = 'tomato' | 'potato' | 'cabbage' | 'carrot' | 'corn' | 'pumpkin' | 'rapeseed';
-export type NpcId = 'grandma' | 'girl' | 'uncle';
-export type ItemKind = 'seed' | 'produce' | 'material' | 'fish' | 'tool';
+export type NpcId = 'grandma' | 'girl' | 'uncle' | 'student' | 'buddy' | 'sweetheart' | 'teacher';
+export type ItemKind = 'seed' | 'produce' | 'material' | 'fish' | 'tool' | 'insect' | 'furniture';
 export type ToastKind = 'info' | 'good' | 'warn';
+export type Grade = 'C' | 'B' | 'A' | 'S';
 
 export interface CropDef {
   id: CropId;
@@ -18,6 +21,8 @@ export interface CropDef {
   color: string;
   leaf: string;
   desc: string;
+  /** 适宜季节；不填表示四季都能种 */
+  seasons?: Season[];
 }
 
 export interface ItemDef {
@@ -88,6 +93,24 @@ export interface ItemMeta {
   quality: number; // 1-3
 }
 
+export interface RatingInfo {
+  score: number;
+  grade: Grade;
+  updatedDay: number;
+  dims: { collection: number; harvest: number; bonds: number; home: number; savings: number };
+}
+
+export interface OfflineReport {
+  days: number;
+  grown: number;
+  eggs: number;
+  manure: number;
+  spoiled: number;
+  streak: number;
+  /** 离线期间村子里发生的小事 */
+  news?: string;
+}
+
 export interface GameState {
   version: number;
   day: number;
@@ -119,6 +142,15 @@ export interface GameState {
   quests: { cook: boolean; harvest: boolean; feed: boolean; talk: boolean };
   discovered: { crops: string[]; fish: string[]; recipes: string[] };
   counters: { harvest: number; cooked: number; fish: number };
+  /** 主角性别，决定可攻略角色 */
+  gender: Gender;
+  /** 最后一次存盘的真实时间（用于离线结算） */
+  lastSavedAt: number;
+  offlineReport: OfflineReport | null;
+  streak: { lastDay: number; count: number };
+  rating: RatingInfo;
+  collections: { insects: string[]; furniture: string[]; festivals: string[] };
+  npcStories: Record<NpcId, { level: number; seen: string[]; romance: boolean }>;
 }
 
 export interface CookResult {

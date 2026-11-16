@@ -110,6 +110,8 @@ export default function FarmPanel({ engine, close }: { engine: GameEngine; close
             ? '有作物熟透了，收下来就能拿去做饭或卖掉。'
             : '每天睡前记得浇水，作物才会长；下雨天可以省点力气。'}
           <br />
+          杂草和虫害只会拖慢生长，作物不会死；拔草、打药后还能接着长，错过几天也不用重来。
+          <br />
           种子：🌱{s.inventory.seed_tomato ?? 0} 番茄 · {s.inventory.seed_carrot ?? 0} 胡萝卜 ·
           {' '}{s.inventory.seed_cabbage ?? 0} 白菜 · 肥料 {(s.inventory.fertilizer ?? 0)} · 农药 {(s.inventory.pesticide ?? 0)}
         </div>
